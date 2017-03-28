@@ -42,7 +42,7 @@ int clock_gettime(clock_id_t which_clock, struct timespec *t);
 #define MAX_TITLE_LENGTH   127
 #define MAX_INI_LENGTH   1024
 
-#define PID_FILE_PATH "/var/run/con_pool_"
+#define PID_FILE_PATH "/var/run/php_connection_pool"
 #define cpLog(str,...)     \
                         do \
                             { \
