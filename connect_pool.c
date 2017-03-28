@@ -64,6 +64,7 @@ static void cp_add_fail_into_mem(zval *conf, zval *data_source);
 
 const zend_function_entry cp_functions[] = {
     PHP_FE(pool_server_create, NULL)
+    PHP_FE(pool_server_status, NULL)
     PHP_FE(pool_server_shutdown, NULL)
     PHP_FE(pool_server_reload, NULL)
     PHP_FE(pool_server_version, NULL)

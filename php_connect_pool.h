@@ -217,6 +217,7 @@ PHP_FUNCTION(pool_server_create);
 PHP_FUNCTION(pool_server_shutdown);
 PHP_FUNCTION(pool_server_reload);
 PHP_FUNCTION(pool_server_version);
+PHP_FUNCTION(pool_server_status);
 
 
 
