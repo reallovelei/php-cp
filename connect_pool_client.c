@@ -56,7 +56,6 @@ static void cpClient_attach_mem()
 
 static void* connect_pool_perisent(zval* zres, zval* data_source)
 {
-    //  cpLog_init("/tmp/pool_client.log");
     zend_resource sock_le;
     int ret;
     cpClient* cli = (cpClient*) pecalloc(sizeof (cpClient), 1, 1);
@@ -99,8 +98,8 @@ static void* connect_pool_perisent(zval* zres, zval* data_source)
     cli->server_fd = info.server_fd;
     cpClient_attach_mem();
     CONN(cli)->release = CP_FD_RELEASED;
-    /*
-    */
+    bzero(&cli->big_data_tmp, sizeof (cli->big_data_tmp));
+    bzero(&cli->slow_log_tmp, sizeof (cli->slow_log_tmp));
     return cli;
 }
 
@@ -119,7 +118,6 @@ static CPINLINE zval * cpConnect_pool_server(zval *data_source, int async)
         data_source = &dummy_source_zval;
         dummy_source_index++;
     }
-
 #if PHP_MAJOR_VERSION < 7
     CP_ALLOC_INIT_ZVAL(zres);
     if (zend_hash_find(&EG(persistent_list), Z_STRVAL_P(data_source), Z_STRLEN_P(data_source), (void **) &p_sock_le) == SUCCESS)
@@ -133,7 +131,6 @@ static CPINLINE zval * cpConnect_pool_server(zval *data_source, int async)
     }
     else
     {//create long connect to pool_server
-
         if (connect_pool_perisent(zres, data_source) == NULL)
         {// error
 #if PHP_MAJOR_VERSION < 7
@@ -164,6 +161,26 @@ static void release_worker(zval *object)
     else
     {
         php_error_docref(NULL TSRMLS_CC, E_WARNING, "data_source can not find,we should do something like query before we release");
+    }
+}
+
+static void close_conn(zval *object)
+{//close the tcp with pool server
+    zval *zres, *data_source;
+    cpClient *cli;
+    if (cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("data_source"), (void **) &data_source) == SUCCESS)
+    {
+        if (cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("cli"), (void **) &zres) == SUCCESS)
+        {
+            char source_char[100] = {0};
+            CP_ZEND_FETCH_RESOURCE_NO_RETURN(cli, cpClient*, &zres, -1, CP_RES_CLIENT_NAME, le_cli_connect_pool);
+            strcat(source_char, Z_STRVAL_P(data_source));
+            if (cli->async)
+            {
+                sprintf(source_char + strlen(source_char), "_%d", cli->dummy_source_index);
+            }
+            cp_zend_hash_del(&EG(persistent_list), source_char, strlen(source_char));
+        }
     }
 }
 
@@ -370,8 +387,8 @@ static cpGroup * cpGet_worker(cpClient *cli, zval *data_source)
                 CPGS->G[group_num].worker_max = CPGS->default_max;
                 CPGS->G[group_num].worker_min = CPGS->default_min;
                 CPGS->G[group_num].worker_num = CPGS->default_min;
-				CPGS->G[group_num].workers_status[CPGS->G[group_num].worker_num-1] = CP_WORKER_IDLE;//foreach to CPGS->default_min to set status???
-				cpCreate_worker_mem(CPGS->G[group_num].worker_num-1, group_num);//foreach to CPGS->default_min to create mem???
+                CPGS->G[group_num].workers_status[CPGS->G[group_num].worker_num - 1] = CP_WORKER_IDLE; //foreach to CPGS->default_min to set status???
+                cpCreate_worker_mem(CPGS->G[group_num].worker_num - 1, group_num); //foreach to CPGS->default_min to create mem???
                 cpTcpEvent event = {0};
                 event.type = CP_TCPEVENT_ADD;
                 event.data = 0;
@@ -384,7 +401,6 @@ static cpGroup * cpGet_worker(cpClient *cli, zval *data_source)
     }
     return G;
 }
-
 
 static CPINLINE int cli_real_send(cpClient **real_cli, zval *send_data)
 {
@@ -410,10 +426,13 @@ static CPINLINE int cli_real_send(cpClient **real_cli, zval *send_data)
         {
             pause();
         }
+        log_start(cli);
+        log_write(send_data, cli);
         ret = CP_CLIENT_SERIALIZE_SEND_MEM(send_data, cli);
     }
     else
     {
+        log_write(send_data, cli);
         ret = CP_CLIENT_SERIALIZE_SEND_MEM(send_data, cli);
     }
     return ret;
@@ -421,10 +440,20 @@ static CPINLINE int cli_real_send(cpClient **real_cli, zval *send_data)
 
 static CPINLINE int cli_real_recv(cpClient *cli, int async)
 {
-    int pipe_fd_read = get_readfd(CONN(cli)->worker_id);
     cpWorkerInfo event;
     int ret = 0;
     int i = 0;
+    zval *ret_value;
+    CP_ALLOC_INIT_ZVAL(ret_value);
+    int pipe_fd_read = get_readfd(CONN(cli)->worker_id);
+    if (async)
+    {
+        RecvData.type = CP_SIGEVENT_TURE;
+        ZVAL_LONG(ret_value, pipe_fd_read);
+        RecvData.ret_value = ret_value;
+        cli->querying = 1;
+        return SUCCESS;
+    }
     do
     {
         ret = cpFifoRead(pipe_fd_read, &event, sizeof (event));
@@ -439,14 +468,14 @@ static CPINLINE int cli_real_recv(cpClient *cli, int async)
                 ret = write(pipe_fd_read, &event, sizeof (event)); //写回去 给其他的fpm
             }
         }
-        if (++i > 1000)
+        if (++i > 100)
         {
+            php_error_docref(NULL TSRMLS_CC, E_ERROR, "you need rm -rf /tmp/con_pool_* and restart pool_server");
             exit(-1);
         }
     } while (event.pid != cpPid); //有可能有脏数据  读出来
 
-    zval *ret_value;
-    CP_ALLOC_INIT_ZVAL(ret_value);
+    log_increase_size(event.len, cli);
     void * buf = get_attach_buf(CONN(cli)->worker_id, CPGS->max_buffer_len, CPGS->G[CONN(cli)->group_id].workers[CONN(cli)->worker_index].sm_obj.mmap_name);
     php_msgpack_unserialize(ret_value, buf, event.len);
     RecvData.type = event.type;
@@ -468,6 +497,28 @@ static CPINLINE int cli_real_recv(cpClient *cli, int async)
 #endif
 */
     return SUCCESS;
+}
+
+static void async_done(zval *object, zend_class_entry *class_entry_ptr)
+{
+    zval *zres;
+    cpClient *cli;
+    if (cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("cli"), (void **) &zres) == SUCCESS)
+    {
+        CP_ZEND_FETCH_RESOURCE_NO_RETURN(cli, cpClient*, &zres, -1, CP_RES_CLIENT_NAME, le_cli_connect_pool);
+        if (!cli->querying)
+        {
+            php_error_docref(NULL TSRMLS_CC, E_ERROR, "you must execute the async function before done");
+        }
+    }
+    else
+    {
+        php_error_docref(NULL TSRMLS_CC, E_ERROR, "can not find zres");
+    }
+    zend_update_property_bool(class_entry_ptr, object, ZEND_STRL("async"), 0 TSRMLS_CC);
+    cli->querying = 0;
+    cpSetIsBlock(get_readfd(CONN(cli)->worker_id), 1);
+    cli_real_recv(cli, 0);
 }
 
 static void check_need_exchange(zval * object, char *cur_type)
@@ -723,7 +774,6 @@ int static stmt_fetch_obj(zval *args, zend_class_entry *ce, zval *return_value)
 PHP_METHOD(pdo_connect_pool_PDOStatement, __call)
 {
     zval *zres, *source_zval, *pass_data, *object, *z_args, *class_name = NULL, stmt_obj_args_dup, *async_zval;
-
     char *cmd;
     zend_size_t cmd_len;
     int async = 0;
@@ -732,12 +782,10 @@ PHP_METHOD(pdo_connect_pool_PDOStatement, __call)
     {
         RETURN_FALSE;
     }
-
-	if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("async"), (void **) &async_zval) == SUCCESS)
+    if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("async"), (void **) &async_zval) == SUCCESS)
     {
         async = Z_BVAL_P(async_zval);
     }
-
     cpClient *cli;
     if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("cli"), (void **) &zres) == SUCCESS)
     {
@@ -773,7 +821,6 @@ PHP_METHOD(pdo_connect_pool_PDOStatement, __call)
     }
     cp_add_assoc_string(pass_data, "method_type", "PDOStatement", 1);
     cp_add_assoc_string(pass_data, "type", "pdo", 1);
-
     int ret = cli_real_send(&cli, pass_data);
     if (ret < 0)
     {
@@ -787,7 +834,7 @@ PHP_METHOD(pdo_connect_pool_PDOStatement, __call)
     }
     else if (RecvData.type == CP_SIGEVENT_STMT_OBJ)
     {//fetchObject return
-        if (class_name)
+        if (class_name && strcasecmp("stdClass", Z_STRVAL_P(class_name)) != 0)
         {//user class
             zend_class_entry *class_ce = cp_zend_fetch_class(class_name, ZEND_FETCH_CLASS_AUTO);
             stmt_fetch_obj(&stmt_obj_args_dup, class_ce, return_value);
@@ -827,7 +874,6 @@ PHP_METHOD(pdo_connect_pool, __call)
     zval *z_args, *pass_data, *object, *zres, *source_zval, *use_ms, *async_zval;
     char *cmd, *cur_type;
     zend_size_t cmd_len;
-    CP_MAKE_STD_ZVAL(zres);
     int async = 0;
 
     if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "Osa", &object, pdo_connect_pool_class_entry_ptr, &cmd, &cmd_len, &z_args) == FAILURE)
@@ -839,8 +885,6 @@ PHP_METHOD(pdo_connect_pool, __call)
     {
         async = Z_BVAL_P(async_zval);
     }
-
-
     if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("use_ms"), (void **) &use_ms) == SUCCESS)
     {
         cur_type = "m";
@@ -895,11 +939,9 @@ PHP_METHOD(pdo_connect_pool, __call)
     {
         php_error_docref(NULL TSRMLS_CC, E_ERROR, "cli_real_send faild error Error: %s [%d] ", strerror(errno), errno);
     }
-
     cli_real_recv(cli, async);
-
     if (RecvData.type == CP_SIGEVENT_PDO)
-    {//返回一个模拟pdo类
+    {
         object_init_ex(return_value, pdo_connect_pool_PDOStatement_class_entry_ptr);
 
         zend_update_property(pdo_connect_pool_PDOStatement_class_entry_ptr, return_value, ZEND_STRL("cli"), zres TSRMLS_CC);
@@ -975,8 +1017,41 @@ PHP_METHOD(pdo_connect_pool, __construct)
 
 PHP_METHOD(pdo_connect_pool, release)
 {
-
     release_worker(getThis());
+    CP_CHECK_RETURN(1);
+}
+
+PHP_METHOD(pdo_connect_pool_PDOStatement, release)
+{
+    release_worker(getThis());
+    CP_CHECK_RETURN(1);
+}
+
+PHP_METHOD(pdo_connect_pool, close)
+{
+    close_conn(getThis());
+    CP_CHECK_RETURN(1);
+}
+
+PHP_METHOD(pdo_connect_pool, setAsync)
+{
+    int async = 0;
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "l!", &async) == FAILURE)
+    {
+        RETURN_FALSE;
+    }
+    zend_update_property_bool(pdo_connect_pool_class_entry_ptr, getThis(), ZEND_STRL("async"), async TSRMLS_CC);
+    CP_CHECK_RETURN(1);
+}
+
+PHP_METHOD(pdo_connect_pool_PDOStatement, setAsync)
+{
+    int async = 0;
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "l!", &async) == FAILURE)
+    {
+        RETURN_FALSE;
+    }
+    zend_update_property_bool(pdo_connect_pool_PDOStatement_class_entry_ptr, getThis(), ZEND_STRL("async"), async TSRMLS_CC);
     CP_CHECK_RETURN(1);
 }
 
@@ -987,9 +1062,25 @@ PHP_METHOD(redis_connect_pool, release)
     CP_CHECK_RETURN(1);
 }
 
+PHP_METHOD(redis_connect_pool, close)
+{
+    close_conn(getThis());
+    CP_CHECK_RETURN(1);
+}
+
+PHP_METHOD(redis_connect_pool, setAsync)
+{
+    int async = 0;
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "l!", &async) == FAILURE)
+    {
+        RETURN_FALSE;
+    }
+    zend_update_property_bool(redis_connect_pool_class_entry_ptr, getThis(), ZEND_STRL("async"), async TSRMLS_CC);
+    CP_CHECK_RETURN(1);
+}
+
 PHP_METHOD(redis_connect_pool, __destruct)
 {
-
 }
 
 PHP_METHOD(redis_connect_pool, __construct)
@@ -1034,6 +1125,12 @@ static cpClient * cpRedis_conn_pool_server(zval *obj, char *source_char, int asy
         CP_ZVAL_STRING(&z_data_source, source_char, 0);
         zval *tmp = cpConnect_pool_server(&z_data_source, async);
         CP_ZEND_FETCH_RESOURCE_NO_RETURN(cli, cpClient*, &tmp, -1, CP_RES_CLIENT_NAME, le_cli_connect_pool);
+        if (async)
+        {//todo check cannot exchange sync/async
+            cli->async = async;
+            cli->dummy_source_index = dummy_source_index - 1;
+        }
+
         zend_update_property(redis_connect_pool_class_entry_ptr, obj, ZEND_STRL("cli"), tmp TSRMLS_CC);
     }
     return cli;
@@ -1042,7 +1139,7 @@ static cpClient * cpRedis_conn_pool_server(zval *obj, char *source_char, int asy
 PHP_METHOD(redis_connect_pool, select)
 {
     zval *ip, *port, *z_args, *pass_data, *object;
-    char source_char[100] = {0};
+    char source_char[CP_SOURCE_MAX] = {0};
     char *db;
     zend_size_t db_len;
     cpClient *cli;
@@ -1091,7 +1188,6 @@ PHP_METHOD(redis_connect_pool, select)
     cp_add_assoc_string(z_args, "db", db, 1);
     add_assoc_zval(pass_data, "args", z_args);
 
-    //int ret = cli_real_send(&cli, pass_data, getThis(), redis_connect_pool_class_entry_ptr);
     int ret = cli_real_send(&cli, pass_data);
     if (ret < 0)
     {
@@ -1112,20 +1208,80 @@ PHP_METHOD(redis_connect_pool, select)
     cp_zval_ptr_dtor(&pass_data);
 }
 
+PHP_METHOD(redis_connect_pool, done)
+{
+    async_done(getThis(), redis_connect_pool_class_entry_ptr);
+    if (RecvData.type == CP_SIGEVENT_EXCEPTION)
+    {
+        zend_throw_exception(NULL, Z_STRVAL_P(RecvData.ret_value), 0 TSRMLS_CC);
+        RETVAL_BOOL(0);
+    }
+    else
+    {
+        RETVAL_ZVAL(RecvData.ret_value, 0, 1); //no copy  destroy
+    }
+}
+
+PHP_METHOD(pdo_connect_pool, done)
+{
+    async_done(getThis(), pdo_connect_pool_class_entry_ptr);
+    if (RecvData.type == CP_SIGEVENT_PDO)
+    {
+        zval *zres, *source_zval;
+        cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("cli"), (void **) &zres);
+        cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("data_source"), (void **) &source_zval);
+        object_init_ex(return_value, pdo_connect_pool_PDOStatement_class_entry_ptr);
+        zend_update_property(pdo_connect_pool_PDOStatement_class_entry_ptr, return_value, ZEND_STRL("cli"), zres TSRMLS_CC);
+        zend_update_property(pdo_connect_pool_PDOStatement_class_entry_ptr, return_value, ZEND_STRL("data_source"), source_zval TSRMLS_CC); //标示这个连接的真实目标
+        cp_zval_ptr_dtor(&RecvData.ret_value);
+    }
+    else if (RecvData.type == CP_SIGEVENT_EXCEPTION)
+    {
+        zend_throw_exception(NULL, Z_STRVAL_P(RecvData.ret_value), 0 TSRMLS_CC);
+        RETVAL_BOOL(0);
+    }
+    else
+    {
+        RETVAL_ZVAL(RecvData.ret_value, 0, 1);
+    }
+}
+
+PHP_METHOD(pdo_connect_pool_PDOStatement, done)
+{
+    async_done(getThis(), pdo_connect_pool_PDOStatement_class_entry_ptr);
+    if (RecvData.type == CP_SIGEVENT_EXCEPTION)
+    {
+        zend_throw_exception(NULL, Z_STRVAL_P(RecvData.ret_value), 0 TSRMLS_CC);
+        RETVAL_BOOL(0);
+    }
+    else if (RecvData.type == CP_SIGEVENT_STMT_OBJ)
+    {//fetchObject return !!!!!cos the user class name ,now just support default class 
+        convert_to_object(RecvData.ret_value);
+#if PHP_MAJOR_VERSION == 7
+        ZVAL_OBJ(return_value, Z_OBJ_P(RecvData.ret_value));
+#else
+        ZVAL_DUP(return_value, RecvData.ret_value);
+#endif
+    }
+    else
+    {
+        RETVAL_ZVAL(RecvData.ret_value, 0, 1);
+    }
+}
+
 PHP_METHOD(redis_connect_pool, __call)
 {
     zval *z_args, *object, *zres, *source_zval, *pass_data, *async_zval;
-    char source_char[100] = {0};
+    char source_char[CP_SOURCE_MAX] = {0};
     char *cmd;
     zend_size_t cmd_len;
     cpClient *cli;
-	int async = 0;
+    int async = 0;
 
     if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "Osa", &object, redis_connect_pool_class_entry_ptr, &cmd, &cmd_len, &z_args) == FAILURE)
     {
         RETURN_FALSE;
     }
-
     if (cp_zend_hash_find(Z_OBJPROP_P(getThis()), ZEND_STRS("async"), (void **) &async_zval) == SUCCESS)
     {
         async = Z_BVAL_P(async_zval);
@@ -1150,8 +1306,8 @@ PHP_METHOD(redis_connect_pool, __call)
         }
     }
     else
-    {//沒select 走db0
-        zval *ip;
+    {
+        zval *ip, *port;
         if (cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("ip"), (void **) &ip) == SUCCESS)
         {
             strcat(source_char, Z_STRVAL_P(ip));
@@ -1162,7 +1318,6 @@ PHP_METHOD(redis_connect_pool, __call)
             php_error_docref(NULL TSRMLS_CC, E_WARNING, "redis_connect_pool: IP is empty ");
             RETURN_FALSE;
         }
-        zval *port;
         if (cp_zend_hash_find(Z_OBJPROP_P(object), ZEND_STRS("port"), (void **) &port) == SUCCESS)
         {
             strcat(source_char, Z_STRVAL_P(port));
@@ -1178,13 +1333,10 @@ PHP_METHOD(redis_connect_pool, __call)
         cp_add_assoc_string(pass_data, "data_source", source_char, 1);
         cli = cpRedis_conn_pool_server(getThis(), source_char, async);
     }
-
-	if (async && cli->querying)
+    if (async && cli->querying)
     {
-        php_error_docref(NULL TSRMLS_CC, E_ERROR, "the obj is async querying now, you can not execute async    function again");
+        php_error_docref(NULL TSRMLS_CC, E_ERROR, "the obj is async querying now, you can not execute async function again");
     }
-
-    //int ret = cli_real_send(&cli, pass_data, getThis(), redis_connect_pool_class_entry_ptr);
     int ret = cli_real_send(&cli, pass_data);
     if (ret < 0)
     {
@@ -1202,5 +1354,42 @@ PHP_METHOD(redis_connect_pool, __call)
         RETVAL_ZVAL(RecvData.ret_value, 0, 1); //no copy  destroy
     }
     cp_zval_ptr_dtor(&pass_data);
+}
+
+PHP_FUNCTION(pool_server_status)
+{
+    long pid;
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "l", &pid) == FAILURE || pid == 0)
+    {
+        php_printf("server is not running. \n");
+        return ;
+    }
+    // 发送信号 失败了
+    if (kill(pid, 0) < 0) {
+        php_printf("server with pid %d has run away unexpectedly. \n", pid);
+        return ;
+    } else {
+        cpClient_attach_mem();
+        php_printf("\nserver with pid %d is running well. \n", pid);
+        cpGroup *G = NULL;
+        int group_id, queue_num;
+        php_printf("\n group number:%d \n", CPGS->group_num);
+
+        // 遍历全局的 每个组里的
+        for (group_id = 0; group_id < CPGS->group_num; group_id++)
+        {
+            queue_num = 0;
+            G = &CPGS->G[group_id];
+            php_printf("\n group %d: %s \n", group_id, G->name);
+            int current_fd = G->first_wait_id;
+            while (current_fd)
+            {
+                cpConnection* conn = &(CPGS->conlist[current_fd]);
+                current_fd = conn->next_wait_id;
+                queue_num++;
+            }
+            php_printf("have used %d,the max conn num is %d, the min num is %d,the queue len is %d\n", G->worker_num, G->worker_max, G->worker_min, queue_num);
+        }
+    }
 }
 
