@@ -1,0 +1,15 @@
+{
+    "name": "php-cp/phpcp",
+    "description": "swoole php connect pool",
+    "type": "project",
+    "require": {
+        "php": ">=7.0.0"
+    },
+    "autoload": {
+    	"files":[],
+        "psr-4":{
+            "phpcp\\": "src/"
+        }
+    }
+}
+
